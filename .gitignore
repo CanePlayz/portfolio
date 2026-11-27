@@ -11,3 +11,9 @@ workspace
 *.ipr
 
 .claude/settings.local.json
+
+### Fork: local IDE files ###
+# m2e preferences created by the VS Code Java extension
+**/.settings/org.eclipse.m2e.core.prefs
+# VS Code workspace settings
+.vscode/
