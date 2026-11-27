@@ -1,0 +1,111 @@
+# Fork only: builds unsigned, self-contained app archives (with bundled JRE) for
+# every push to master and publishes them as the rolling pre-release "snapshot".
+# The upstream repository never runs this workflow.
+name: Fork Snapshot
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # Build provenance: id-token signs via Sigstore, attestations stores the result
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: fork-snapshot
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    name: Build and publish snapshot
+    if: github.repository != 'portfolio-performance/portfolio'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Maven artifacts
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          # Include .target files: Tycho resolves OSGi dependencies from the
+          # target platform definition, which is not captured by pom.xml alone
+          key: ${{ runner.os }}-mvn-snapshot-${{ hashFiles('**/pom.xml', '**/*.target') }}
+          restore-keys: |
+            ${{ runner.os }}-mvn-
+
+      - name: Set up Zulu JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: zulu
+
+      - name: Set up Maven 3.9.16
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.9.16
+
+      # A fork build must not update itself from the official update site:
+      # a newer official release would replace the fork's bundles. The change
+      # is applied at build time only, so the source stays identical to upstream.
+      - name: Disable automatic updates
+        run: |
+          file=name.abuchen.portfolio.ui/src/name/abuchen/portfolio/ui/preferences/PreferencesInitializer.java
+          grep -q 'Preferences.AUTO_UPDATE, true' "$file" || { echo "::error::AUTO_UPDATE default not found in $file"; exit 1; }
+          sed -i 's/Preferences.AUTO_UPDATE, true/Preferences.AUTO_UPDATE, false/' "$file"
+
+      - name: Build, test and package
+        run: |
+          mvn verify \
+            --batch-mode \
+            -Pdefault,package-distro,openapi-lint,openapi-compat \
+            --file portfolio-app/pom.xml
+
+      - name: Collect archives
+        id: collect
+        run: |
+          mkdir -p dist
+          find portfolio-product/target/products -maxdepth 1 -type f \
+            \( -name 'PortfolioPerformance-distro-*.zip' -o -name 'PortfolioPerformance-distro-*.tar.gz' \) \
+            -exec cp {} dist/ \;
+          if [ -z "$(ls -A dist)" ]; then
+            echo "::error::No archives found in portfolio-product/target/products"
+            ls -la portfolio-product/target/products || true
+            exit 1
+          fi
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      # Signed statement that each archive was built by this workflow from
+      # this commit. Free for public repositories; does not replace Windows
+      # Authenticode or Apple notarization.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Publish rolling pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          short_sha="${GITHUB_SHA::9}"
+          build_date="$(date -u +%Y-%m-%d)"
+          cat > notes.md <<EOF
+          Automatic build of commit [\`${short_sha}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}) from \`master\`, built on ${build_date} (UTC).
+
+          - Build log with all tests: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - Checksums: \`SHA256SUMS.txt\`
+          - Provenance: \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\` checks that a file was built by this workflow from this repository.
+          - Archives include a Java runtime. They are **not signed**: Windows SmartScreen warns on first start; on macOS run \`xattr -dr com.apple.quarantine PortfolioPerformance.app\`.
+          - Automatic updates are turned off in this build, so it does not replace itself with an official release.
+          - Files saved by fork features may not open in the official Portfolio Performance.
+          EOF
+          gh release delete snapshot --cleanup-tag --yes || true
+          gh release create snapshot dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Snapshot ${build_date} (${short_sha})" \
+            --notes-file notes.md
